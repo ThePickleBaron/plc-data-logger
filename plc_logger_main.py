@@ -82,9 +82,20 @@ class PLCDataLogger:
         
         # Load device info
         self.load_device_info()
-        
-        # Initialize data retention
-        self.cleanup_old_data()
+
+        # Add this method to the PLCDataLogger class in plc_logger_main.py
+
+    def save_device_info(self) -> None:
+        """Save device information to JSON file"""
+        try:
+            device_info_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'device_info.json')
+            with open(device_info_file, 'w') as f:
+                json.dump(self.device_info, f, indent=2)
+            self.logger.info("Device information saved successfully")
+        except Exception as e:
+            self.logger.error(f"Error saving device info: {e}")        
+            # Initialize data retention
+            self.cleanup_old_data()
 
     def load_device_info(self) -> None:
         """Load known device information from file or create default"""
