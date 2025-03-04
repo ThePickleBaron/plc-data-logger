@@ -14,10 +14,12 @@ import gzip
 import shutil
 import threading
 import ipaddress
+import re
+from queue import Queue
 from datetime import datetime, timedelta
 from pathlib import Path
 import csv
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import matplotlib
@@ -32,6 +34,92 @@ from pylogix import PLC
 HISTORY_LIMIT = 500  # Reduced from 1000 for better memory usage
 UPDATE_INTERVAL = 1000  # GUI update interval in milliseconds
 BATCH_SIZE = 10  # Number of tags to read in a single batch
+MAX_QUEUE_SIZE = HISTORY_LIMIT * 2
+MIN_DISK_SPACE_GB = 1
+
+class BufferedFileWriter:
+    """Thread-safe buffered file writer with batch commits"""
+    def __init__(self, logger: logging.Logger):
+        self.buffer: List[List[str]] = []
+        self.logger = logger
+        self._lock = threading.Lock()
+        self.last_flush = time.time()
+        self.current_file = None
+        self.header = None
+        
+    def set_file(self, filename: str, header: List[str]) -> None:
+        """Set the current file and prepare it if needed"""
+        with self._lock:
+            self.current_file = filename
+            self.header = header
+            
+            # Create the file with header if it doesn't exist
+            if not os.path.exists(filename):
+                try:
+                    os.makedirs(os.path.dirname(filename), exist_ok=True)
+                    with open(filename, 'w', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow(header)
+                except Exception as e:
+                    self.logger.error(f"Failed to create file {filename}: {e}")
+        
+    def add_record(self, record: Dict[str, Any], header: List[str]) -> None:
+        """Add a record to the buffer"""
+        with self._lock:
+            try:
+                row = [str(record.get(col, "")) for col in header]
+                self.buffer.append(row)
+                
+                # Auto-flush if buffer size exceeds limit or 60 seconds passed
+                if len(self.buffer) >= BATCH_SIZE or (time.time() - self.last_flush) > 60:
+                    self.flush()
+            except Exception as e:
+                self.logger.error(f"Buffer add failed: {e}")
+
+    def flush(self) -> None:
+        """Flush buffer to disk"""
+        with self._lock:
+            if not self.buffer or not self.current_file:
+                return
+                
+            try:
+                with open(self.current_file, 'a', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerows(self.buffer)
+                self.buffer.clear()
+                self.last_flush = time.time()
+            except Exception as e:
+                self.logger.error(f"Buffer flush failed: {e}")
+
+class PLCConnectionPool:
+    """Manage PLC connections with connection pooling"""
+    
+    def __init__(self, logger):
+        self.connections = {}
+        self.logger = logger
+        self._lock = threading.Lock()
+    
+    def get_connection(self, ip_address: str) -> PLC:
+        """Get an existing connection or create a new one"""
+        with self._lock:
+            if ip_address not in self.connections:
+                conn = PLC()
+                conn.IPAddress = ip_address
+                conn.Timeout = 5000
+                self.connections[ip_address] = conn
+                self.logger.debug(f"Created new PLC connection to {ip_address}")
+            return self.connections[ip_address]
+    
+    def close_all(self):
+        """Close all connections in the pool"""
+        with self._lock:
+            for ip, conn in self.connections.items():
+                try:
+                    conn.Close()
+                    self.logger.debug(f"Closed PLC connection to {ip}")
+                except Exception as e:
+                    self.logger.error(f"Error closing PLC connection to {ip}: {e}")
+            self.connections.clear()
 
 # Configure logging
 def setup_logging() -> logging.Logger:
@@ -72,9 +160,16 @@ class PLCDataLogger:
         self.detected_tags: Dict[str, List[str]] = {}  # Dict of {ip: [tags]}
         self.device_info: Dict[str, Dict[str, str]] = {}  # Dict of {ip: {type, description}}
         
-        # Data storage
-        self.data_history: List[Dict[str, Any]] = []  # List of dicts with tag values
+        # Data storage with thread safety
+        self.data_queue: Queue = Queue(maxsize=MAX_QUEUE_SIZE)
+        self.data_lock = threading.Lock()
+        self.file_writer = BufferedFileWriter(self.logger)
+        self.last_disk_check = time.time()
+        self.last_file_time = time.time()
         self.current_filename: Optional[str] = None
+        
+        # PLC connection management
+        self.connection_pool = PLCConnectionPool(self.logger)
         
         # Control flags
         self.running = False
@@ -82,8 +177,6 @@ class PLCDataLogger:
         
         # Load device info
         self.load_device_info()
-
-        # Add this method to the PLCDataLogger class in plc_logger_main.py
 
     def save_device_info(self) -> None:
         """Save device information to JSON file"""
@@ -93,7 +186,7 @@ class PLCDataLogger:
                 json.dump(self.device_info, f, indent=2)
             self.logger.info("Device information saved successfully")
         except Exception as e:
-            self.logger.error(f"Error saving device info: {e}")        
+            self.logger.error(f"Error saving device info: {e}")
             # Initialize data retention
             self.cleanup_old_data()
 
@@ -146,9 +239,22 @@ class PLCDataLogger:
                 # Process CSV files
                 for file in log_dir.glob("plc_data_*.csv"):
                     try:
-                        # Extract date from filename
-                        date_str = file.stem.split('_')[-1]
-                        file_date = datetime.strptime(date_str, "%Y%m%d_%H%M%S")
+                        # Extract date from filename safely
+                        date_str = file.stem.split('_')[-2:]  # Get last two parts after split
+                        if len(date_str) >= 2:
+                            full_date_str = '_'.join(date_str)
+                            try:
+                                file_date = datetime.strptime(full_date_str, "%Y%m%d_%H%M%S")
+                            except ValueError:
+                                # Try alternative format with just the date part
+                                try:
+                                    file_date = datetime.strptime(date_str[0], "%Y%m%d")
+                                except ValueError:
+                                    self.logger.warning(f"Could not parse date from filename: {file.name}")
+                                    continue
+                        else:
+                            self.logger.warning(f"Unexpected filename format: {file.name}")
+                            continue
                         
                         if file_date < cutoff_date:
                             # Compress old files
@@ -168,148 +274,180 @@ class PLCDataLogger:
                         
         except Exception as e:
             self.logger.error(f"Error during data cleanup: {e}")
+            
+    def _check_file_rotation(self) -> bool:
+        """Check if it's time to rotate the log file"""
+        if not self.current_filename or not os.path.exists(self.current_filename):
+            return True
+            
+        try:
+            # Check file size
+            file_size = os.path.getsize(self.current_filename)
+            if file_size > 100 * 1024 * 1024:  # 100 MB
+                self.logger.info(f"Rotating log file due to size: {file_size / (1024*1024):.2f} MB")
+                return True
+                
+            # Check time elapsed
+            current_time = time.time()
+            if current_time - self.last_file_time >= self.save_interval:
+                self.logger.info("Rotating log file due to time interval")
+                return True
+                
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error checking file rotation: {e}")
+            return True  # Rotate on error to be safe
 
     def _create_new_logfile(self):
-        """Create a new log file for data storage"""
+        """Create a new log file with robustness improvements"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        # Check for USB drives
-        usb_drives = self.discover_usb_drives()
-        if usb_drives:
-            # Use the first USB drive
-            base_dir = os.path.join(usb_drives[0], "plc_data_logs")
-        else:
-            # Fallback to local logs directory
-            base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-        
-        # Create directory if it doesn't exist
-        os.makedirs(base_dir, exist_ok=True)
-        
-        # Create filename
-        self.current_filename = os.path.join(base_dir, f"plc_data_{timestamp}.csv")
-        
-        # Write header row
+        # Choose storage location
         try:
-            with open(self.current_filename, 'w') as f:
-                # Create header with all expected tags
-                header = ["timestamp"]
-                
-                for ip in self.ip_addresses:
-                    tags = self.tags_to_log.get(ip, [])
-                    for tag in tags:
-                        header.append(f"{ip}_{tag}")
-                
-                f.write(",".join(header) + "\n")
+            # Check for USB drives with sufficient space
+            usb_drives = self.discover_usb_drives()
+            base_dir = None
+            
+            for drive in usb_drives:
+                try:
+                    # Check available space
+                    if sys.platform.startswith('linux'):
+                        stat = os.statvfs(drive)
+                        free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
+                    else:
+                        # Windows - simpler approach
+                        import ctypes
+                        free_bytes = ctypes.c_ulonglong(0)
+                        ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                            ctypes.c_wchar_p(drive), None, None, ctypes.pointer(free_bytes))
+                        free_gb = free_bytes.value / (1024**3)
+                        
+                    if free_gb >= MIN_DISK_SPACE_GB:
+                        base_dir = os.path.join(drive, "plc_data_logs")
+                        self.logger.info(f"Using USB drive at {drive} with {free_gb:.1f}GB available")
+                        break
+                except Exception as e:
+                    self.logger.warning(f"Error checking space on {drive}: {e}")
+                    
+            # Fallback to local logs directory
+            if not base_dir:
+                base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+                self.logger.info("Using local storage for logs")
+            
+            # Create directory if it doesn't exist
+            os.makedirs(base_dir, exist_ok=True)
+            
+            # Create filename with the full timestamp format
+            self.current_filename = os.path.join(base_dir, f"plc_data_{timestamp}.csv")
+            self.last_file_time = time.time()
+            
+            # Create header for the new file
+            header = ["timestamp"]
+            for ip in self.ip_addresses:
+                tags = self.tags_to_log.get(ip, [])
+                for tag in tags:
+                    header.append(f"{ip}_{tag}")
+            
+            # Set the file in the file writer
+            self.file_writer.set_file(self.current_filename, header)
                 
             # Run cleanup after creating new file
-            self.cleanup_old_data()
+            threading.Thread(target=self.cleanup_old_data, daemon=True).start()
                 
         except Exception as e:
             self.logger.error(f"Error creating log file: {e}")
             self.current_filename = None
 
-    def _write_data_to_file(self, data_point):
-        """Write a data point to the current log file
-        
-        Args:
-            data_point (dict): Data point to write
-        """
-        if not self.current_filename:
-            return
-        
+    def _check_system_resources(self) -> bool:
+        """Check disk space and memory"""
         try:
-            with open(self.current_filename, 'a') as f:
-                # Get all expected columns from file header
-                with open(self.current_filename, 'r') as read_f:
-                    header = read_f.readline().strip().split(',')
+            # Disk space check
+            if (time.time() - self.last_disk_check) > 3600:  # 1 hour
+                if sys.platform.startswith('linux'):
+                    stat = os.statvfs('/')
+                    free_gb = (stat.f_bavail * stat.f_frsize) / (1024**3)
+                else:
+                    # Windows
+                    import ctypes
+                    free_bytes = ctypes.c_ulonglong(0)
+                    ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+                        ctypes.c_wchar_p("C:\\"), None, None, ctypes.pointer(free_bytes))
+                    free_gb = free_bytes.value / (1024**3)
+                    
+                if free_gb < MIN_DISK_SPACE_GB:
+                    self.logger.critical(f"Insufficient disk space: {free_gb:.1f}GB")
+                    return False
+                self.last_disk_check = time.time()
                 
-                # Create a row with values for each column
-                row = []
-                for col in header:
-                    if col in data_point:
-                        row.append(str(data_point[col]))
-                    else:
-                        row.append("")
+            # Memory check
+            try:
+                import resource
+                mem_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                if mem_usage > 500 * 1024:  # 500MB
+                    self.logger.warning(f"High memory usage: {mem_usage/1024:.1f}MB")
+            except ImportError:
+                # resource module not available on Windows
+                pass
                 
-                f.write(",".join(row) + "\n")
-                f.flush()  # Ensure data is written immediately
-                
+            return True
         except Exception as e:
-            self.logger.error(f"Error writing to log file: {e}")
-            # Try to create a new file on error
-            self._create_new_logfile()
-
-    def load_config(self) -> Dict[str, Any]:
-        """Load configuration from JSON file."""
-        try:
-            with open(self.config_file, 'r') as f:
-                return json.load(f)
-        except FileNotFoundError:
-            self.logger.error(f"Configuration file {self.config_file} not found")
-            sys.exit(1)
-        except json.JSONDecodeError:
-            self.logger.error(f"Invalid JSON in configuration file {self.config_file}")
-            sys.exit(1)
-
-    def setup_data_logging(self):
-        """Setup CSV file for data logging."""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        data_file = Path("logs") / f"plc_data_{timestamp}.csv"
-        
-        self.data_file = open(data_file, 'w', newline='')
-        self.csv_writer = csv.writer(self.data_file)
-        
-        # Write header
-        self.csv_writer.writerow(['timestamp'] + self.config.get('data_points', []))
+            self.logger.error(f"Resource check failed: {e}")
+            return True  # Continue on check failure
 
     def _read_plc_data(self) -> Dict[str, Any]:
-        """Read current data from all PLCs with automatic reconnection
-        
-        Returns:
-            Dict[str, Any]: Current tag values with timestamp
-        """
+        """Read current data from all PLCs with improved error handling"""
         data_point = {"timestamp": datetime.now().isoformat()}
         max_retries = 3
         retry_delay = 5  # seconds
         
         for ip in self.ip_addresses:
             retries = 0
-            while retries < max_retries:
+            success = False
+            
+            while retries < max_retries and not success and not self.stop_event.is_set():
                 try:
                     # Get tags to read for this IP
                     tags_to_read = self.tags_to_log.get(ip, [])
                     if not tags_to_read:
                         break
                     
-                    with PLC() as comm:
-                        comm.IPAddress = ip
-                        comm.Timeout = 5000  # 5 second timeout
-                        
-                        # Read all tags at once for better performance
-                        results = comm.Read(tags_to_read)
+                    # Use connection pool instead of creating new connections
+                    comm = self.connection_pool.get_connection(ip)
+                    
+                    # Use batch reading for better performance
+                    for i in range(0, len(tags_to_read), BATCH_SIZE):
+                        batch = tags_to_read[i:i+BATCH_SIZE]
+                        results = comm.Read(batch)
                         
                         # Process results
                         if isinstance(results, list):
-                            for i, result in enumerate(results):
+                            for j, result in enumerate(results):
                                 if result.Status == "Success":
-                                    # Use tag name with IP as key to avoid conflicts
-                                    tag_key = f"{ip}_{tags_to_read[i]}"
+                                    tag_key = f"{ip}_{batch[j]}"
                                     data_point[tag_key] = result.Value
+                                else:
+                                    self.logger.warning(f"Read failed for {ip}_{batch[j]}: {result.Status}")
+                                    tag_key = f"{ip}_{batch[j]}"
+                                    data_point[tag_key] = None
                         else:
                             # Single tag read
                             if results.Status == "Success":
-                                tag_key = f"{ip}_{tags_to_read[0]}"
+                                tag_key = f"{ip}_{batch[0]}"
                                 data_point[tag_key] = results.Value
-                        
-                        # Success - break retry loop
-                        break
+                            else:
+                                self.logger.warning(f"Read failed for {ip}_{batch[0]}: {results.Status}")
+                                tag_key = f"{ip}_{batch[0]}"
+                                data_point[tag_key] = None
+                    
+                    success = True
                         
                 except Exception as e:
                     retries += 1
                     self.logger.warning(f"Attempt {retries}/{max_retries} failed for {ip}: {e}")
                     
-                    if retries < max_retries:
-                        time.sleep(retry_delay)
+                    if retries < max_retries and not self.stop_event.is_set():
+                        time.sleep(retry_delay * retries)  # Progressive backoff
                     else:
                         self.logger.error(f"Failed to read from {ip} after {max_retries} attempts")
                         # Mark all tags for this IP as failed
@@ -320,23 +458,21 @@ class PLCDataLogger:
         return data_point
 
     def _logging_thread(self, update_callback):
-        """Thread function for continuous logging with error recovery
-        
-        Args:
-            update_callback (function): Callback function for UI updates
-        """
-        last_file_time = time.time()
+        """Thread function for continuous logging with error recovery"""
         consecutive_errors = 0
         max_consecutive_errors = 5
         error_delay = 30  # seconds
         
         while not self.stop_event.is_set():
             try:
+                # Check system resources
+                if not self._check_system_resources():
+                    time.sleep(30)
+                    continue
+                    
                 # Check if it's time to create a new log file
-                current_time = time.time()
-                if current_time - last_file_time >= self.save_interval:
+                if self._check_file_rotation():
                     self._create_new_logfile()
-                    last_file_time = current_time
                 
                 # Read data from all PLCs
                 data_point = self._read_plc_data()
@@ -344,23 +480,38 @@ class PLCDataLogger:
                 # Reset error counter on successful read
                 consecutive_errors = 0
                 
-                # Store data in memory history (limit to 1000 points to avoid memory issues)
-                self.data_history.append(data_point)
-                if len(self.data_history) > 1000:
-                    self.data_history.pop(0)
+                # Store data in memory with thread safety
+                with self.data_lock:
+                    if self.data_queue.qsize() >= HISTORY_LIMIT:
+                        # Remove oldest item if queue is full
+                        try:
+                            self.data_queue.get_nowait()
+                        except:
+                            pass
+                    self.data_queue.put(data_point)
+                
+                # Get the current file header
+                header = ["timestamp"]
+                for ip in self.ip_addresses:
+                    tags = self.tags_to_log.get(ip, [])
+                    for tag in tags:
+                        header.append(f"{ip}_{tag}")
                 
                 # Write to log file
-                self._write_data_to_file(data_point)
+                try:
+                    if self.current_filename:
+                        self.file_writer.add_record(data_point, header)
+                except Exception as e:
+                    self.logger.error(f"Error writing to file: {e}")
+                    # Try to create a new file on error
+                    self._create_new_logfile()
                 
                 # Call the update callback if provided
                 if update_callback:
                     update_callback(data_point)
                 
                 # Wait for the next sample
-                for _ in range(int(self.sample_interval)):
-                    if self.stop_event.is_set():
-                        break
-                    time.sleep(1)
+                self._wait_for_next_sample()
                     
             except Exception as e:
                 consecutive_errors += 1
@@ -372,36 +523,21 @@ class PLCDataLogger:
                     break
                 
                 # Exponential backoff for error delay
-                time.sleep(error_delay * (2 ** (consecutive_errors - 1)))
-
-    def log_data(self):
-        """Log data from PLC to CSV file."""
-        try:
-            data = self.read_plc_data()
-            timestamp = datetime.now().isoformat()
-            
-            # Write data row
-            self.csv_writer.writerow([timestamp] + [data.get(point, '') for point in self.config.get('data_points', [])])
-            self.data_file.flush()
-            
-            self.logger.info(f"Logged data: {data}")
-        except Exception as e:
-            self.logger.error(f"Error logging data: {e}")
-
-    def run(self):
-        """Main application loop."""
-        self.logger.info("Starting PLC Data Logger")
-        self.setup_data_logging()
-        
-        try:
-            while True:
-                self.log_data()
-                time.sleep(self.config.get('logging_interval', 1))
-        except KeyboardInterrupt:
-            self.logger.info("Stopping PLC Data Logger")
-        finally:
-            if self.data_file:
-                self.data_file.close()
+                backoff_time = error_delay * (2 ** (consecutive_errors - 1))
+                self.logger.warning(f"Backing off for {backoff_time} seconds")
+                
+                # Wait with stop check
+                for _ in range(int(backoff_time)):
+                    if self.stop_event.is_set():
+                        break
+                    time.sleep(1)
+    
+    def _wait_for_next_sample(self):
+        """Wait for the next sample interval with stop check"""
+        for _ in range(int(self.sample_interval)):
+            if self.stop_event.is_set():
+                break
+            time.sleep(1)
 
     def discover_usb_drives(self) -> List[str]:
         """Discover mounted USB drives with fallback methods
@@ -460,29 +596,38 @@ class PLCDataLogger:
             ip_network = ipaddress.ip_network(self.ip_range, strict=False)
             discovered = []
             
+            self.logger.info(f"Starting IP scan of {self.ip_range}")
+            
             # Scan each IP in the range
             for ip in ip_network.hosts():
                 ip_str = str(ip)
                 try:
+                    self.logger.info(f"Checking IP: {ip_str}")
                     with PLC() as comm:
                         comm.IPAddress = ip_str
                         comm.Timeout = 2000  # 2 seconds timeout for scanning
                         
                         # Try to read a simple tag to test connection
                         ret = comm.GetModuleProperties()
-                        if ret.Value is not None:
+                        self.logger.info(f"Result for {ip_str}: {ret.Status}")
+                        
+                        if ret.Status == "Success" and ret.Value is not None:
                             # Save device info
                             self.device_info[ip_str] = {
                                 "type": ret.Value.ProductName if hasattr(ret.Value, 'ProductName') else "Unknown",
                                 "description": f"Device at {ip_str}"
                             }
                             discovered.append(ip_str)
-                except Exception:
+                            self.logger.info(f"Discovered PLC at {ip_str}")
+                except Exception as e:
                     # Skip non-responsive IPs
+                    self.logger.debug(f"No response from {ip_str}: {e}")
                     pass
             
             # Save updated device info
             self.save_device_info()
+            
+            self.logger.info(f"IP scan completed. Found {len(discovered)} devices")
             return discovered
             
         except Exception as e:
@@ -527,6 +672,172 @@ class PLCDataLogger:
             self.logger.error(f"Error discovering tags: {e}")
             return []
 
+    def import_tags_from_file(self, filename: str, ip_address: str) -> List[str]:
+        """Import tags from a file (supports CSV, TXT and XML formats)
+        
+        Args:
+            filename (str): Path to the file with tags
+            ip_address (str): IP address to associate with the tags
+            
+        Returns:
+            List[str]: List of imported tag names
+        """
+        imported_tags = []
+        try:
+            file_ext = os.path.splitext(filename)[1].lower()
+            
+            if file_ext == '.csv':
+                imported_tags = self._import_tags_from_csv(filename, ip_address)
+            elif file_ext == '.txt':
+                imported_tags = self._import_tags_from_txt(filename, ip_address)
+            elif file_ext == '.xml':
+                imported_tags = self._import_tags_from_xml(filename, ip_address)
+            else:
+                self.logger.error(f"Unsupported file format: {file_ext}")
+                return []
+                
+            # Update tags for this IP address
+            if ip_address not in self.tags_to_log:
+                self.tags_to_log[ip_address] = []
+                
+            # Add tags that don't already exist
+            for tag in imported_tags:
+                if tag not in self.tags_to_log[ip_address]:
+                    self.tags_to_log[ip_address].append(tag)
+                    
+            return imported_tags
+            
+        except Exception as e:
+            self.logger.error(f"Error importing tags: {e}")
+            return []
+            
+    def _import_tags_from_csv(self, filename: str, ip_address: str) -> List[str]:
+        """Import tags from a CSV file
+        
+        Args:
+            filename (str): Path to the CSV file
+            ip_address (str): IP address to associate with the tags
+            
+        Returns:
+            List[str]: List of imported tag names
+        """
+        imported_tags = []
+        try:
+            with open(filename, 'r') as f:
+                # Try to determine dialect
+                sample = f.read(1024)
+                f.seek(0)
+                
+                sniffer = csv.Sniffer()
+                has_header = sniffer.has_header(sample)
+                dialect = sniffer.sniff(sample)
+                
+                reader = csv.reader(f, dialect)
+                
+                # Skip header if present
+                if has_header:
+                    next(reader)
+                    
+                # Look for tag names in the first column
+                for row in reader:
+                    if row and len(row) > 0 and row[0].strip():  # Check if row exists and first cell is not empty
+                        tag_name = row[0].strip()
+                        # Remove any quotes or extra whitespace
+                        tag_name = tag_name.strip('"\'')
+                        imported_tags.append(tag_name)
+                        
+            self.logger.info(f"Imported {len(imported_tags)} tags from CSV file")
+            return imported_tags
+            
+        except Exception as e:
+            self.logger.error(f"Error importing tags from CSV: {e}")
+            return []
+            
+    def _import_tags_from_txt(self, filename: str, ip_address: str) -> List[str]:
+        """def _import_tags_from_txt(self, filename: str, ip_address: str) -> List[str]:
+
+        
+        Args:
+            filename (str): Path to the TXT file
+            ip_address (str): IP address to associate with the tags
+            
+        Returns:
+            List[str]: List of imported tag names
+        """
+        imported_tags = []
+        try:
+            with open(filename, 'r') as f:
+                lines = f.readlines()
+                
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith('#'):  # Skip empty lines and comments
+                        # Try to extract the tag name
+                        parts = line.split(',')  # Handle comma-separated formats
+                        tag_name = parts[0].strip()
+                        
+                        # Remove any quotes or extra whitespace
+                        tag_name = tag_name.strip('"\'')
+                        
+                        if tag_name:
+                            imported_tags.append(tag_name)
+                        
+            self.logger.info(f"Imported {len(imported_tags)} tags from TXT file")
+            return imported_tags
+            
+        except Exception as e:
+            self.logger.error(f"Error importing tags from TXT: {e}")
+            return []
+            
+    def _import_tags_from_xml(self, filename: str, ip_address: str) -> List[str]:
+        """Import tags from an XML file (FactoryTalk XML export)
+        
+        Args:
+            filename (str): Path to the XML file
+            ip_address (str): IP address to associate with the tags
+            
+        Returns:
+            List[str]: List of imported tag names
+        """
+        imported_tags = []
+        try:
+            import xml.etree.ElementTree as ET
+            
+            tree = ET.parse(filename)
+            root = tree.getroot()
+            
+            # Look for tag elements with different potential formats
+            
+            # Format 1: FactoryTalk tag export
+            tags = root.findall(".//Tag")
+            for tag in tags:
+                name_attr = tag.get('Name')
+                if name_attr:
+                    imported_tags.append(name_attr)
+                    
+            # Format 2: Tag names in TagName elements
+            if not imported_tags:
+                tag_elements = root.findall(".//TagName")
+                for tag_element in tag_elements:
+                    if tag_element.text:
+                        imported_tags.append(tag_element.text.strip())
+            
+            # Format 3: Tag names as element names with 'tag' prefix
+            if not imported_tags:
+                for element in root.findall(".//*"):
+                    tag_name = element.tag
+                    if tag_name.lower().startswith('tag'):
+                        name_value = element.get('name') or element.text
+                        if name_value:
+                            imported_tags.append(name_value.strip())
+                            
+            self.logger.info(f"Imported {len(imported_tags)} tags from XML file")
+            return imported_tags
+            
+        except Exception as e:
+            self.logger.error(f"Error importing tags from XML: {e}")
+            return []
+
     def start_logging(self, update_callback: Optional[callable] = None) -> None:
         """Start the data logging process
         
@@ -548,12 +859,29 @@ class PLCDataLogger:
                          daemon=True).start()
 
     def stop_logging(self) -> None:
-        """Stop the logging process"""
+        """Stop the logging process with clean shutdown"""
         if not self.running:
             return
         
         self.stop_event.set()
         self.running = False
+        
+        # Ensure all data is written to disk
+        try:
+            self.file_writer.flush()
+            self.logger.info("Flushed remaining data to disk")
+        except Exception as e:
+            self.logger.error(f"Error during final flush: {e}")
+        
+        # Close all PLC connections
+        try:
+            self.connection_pool.close_all()
+        except Exception as e:
+            self.logger.error(f"Error closing PLC connections: {e}")
+        
+        # Wait for threads to terminate gracefully
+        self.logger.info("Waiting for threads to terminate...")
+        time.sleep(1)  # Give threads time to finish
 
 class PLCLoggerGUI(tk.Tk):
     def __init__(self):
@@ -590,6 +918,9 @@ class PLCLoggerGUI(tk.Tk):
         
         # Configure update intervals
         self._configure_update_intervals()
+        
+        # Set up application closing event
+        self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     def _init_gui_variables(self) -> None:
         """Initialize GUI variables with proper typing"""
@@ -643,38 +974,49 @@ class PLCLoggerGUI(tk.Tk):
 
     def _update_monitor(self):
         """Update monitor with optimized performance and error handling"""
-        if not self.monitor_tree or not hasattr(self.logger, 'data_history'):
+        if not self.monitor_tree:
+            self.after(UPDATE_INTERVAL, self._update_monitor)
             return
         
         try:
-            if self.logger.data_history:
-                current_data = self.logger.data_history[-1]
-                existing_items = set()
+            # Get data from the queue safely
+            with self.logger.data_lock:
+                if self.logger.data_queue.empty():
+                    self.after(UPDATE_INTERVAL, self._update_monitor)
+                    return
                 
-                # Get existing items for comparison
-                for item in self.monitor_tree.get_children():
-                    tag_name = self.monitor_tree.item(item)['values'][0]
-                    existing_items.add(tag_name)
-                    if tag_name in current_data:
-                        new_value = current_data[tag_name]
-                        current_values = self.monitor_tree.item(item)['values']
-                        if str(new_value) != str(current_values[1]):
-                            self.monitor_tree.item(item, values=(
-                                tag_name,
-                                new_value,
-                                current_data.get('timestamp', ''),
-                                'OK' if new_value is not None else 'Error'
-                            ))
+                # Get the latest data point
+                data_items = list(self.logger.data_queue.queue)
+                if not data_items:
+                    self.after(UPDATE_INTERVAL, self._update_monitor)
+                    return
+                    
+                current_data = data_items[-1]  # Get the latest item
                 
-                # Add new items that don't exist
-                for tag_name, value in current_data.items():
-                    if tag_name != 'timestamp' and tag_name not in existing_items:
-                        self.monitor_tree.insert('', 'end', values=(
-                            tag_name,
-                            value,
-                            current_data.get('timestamp', ''),
-                            'OK' if value is not None else 'Error'
-                        ))
+            # Clear existing items for a complete refresh
+            for item in self.monitor_tree.get_children():
+                self.monitor_tree.delete(item)
+            
+            # Add all items from the latest data point
+            timestamp = current_data.get('timestamp', '')
+            for key, value in current_data.items():
+                if key != 'timestamp':
+                    try:
+                        # Extract IP and tag from the key
+                        parts = key.split('_', 1)
+                        if len(parts) == 2:
+                            ip, tag = parts
+                            status = "OK" if value is not None else "Error"
+                            self.monitor_tree.insert('', 'end', values=(key, value, timestamp, status))
+                    except Exception as e:
+                        self.logger.error(f"Error processing tag {key}: {e}")
+            
+            # Update tag combo for trends if needed
+            self.update_tag_combo()
+            
+        except RuntimeError as e:
+            # Handle thread safety issues
+            self.logger.error(f"GUI update error: {e}")
         except Exception as e:
             self.logger.error(f"Error updating monitor: {e}")
         finally:
@@ -686,35 +1028,52 @@ class PLCLoggerGUI(tk.Tk):
 
     def _update_trends(self):
         """Update trends with optimized performance"""
-        if self.canvas and self.ax:
-            try:
-                selected_tag = self.tag_var.get()
-                if selected_tag and self.logger.data_history:
-                    # Clear previous plot
-                    self.ax.clear()
-                    
-                    # Convert data to pandas for efficient processing
-                    df = pd.DataFrame(self.logger.data_history[-HISTORY_LIMIT:])
-                    if 'timestamp' in df.columns and selected_tag in df.columns:
-                        df['timestamp'] = pd.to_datetime(df['timestamp'])
-                        self.ax.plot(df['timestamp'], df[selected_tag])
-                        
-                        # Optimize plot appearance
-                        self.ax.set_xlabel('Time')
-                        self.ax.set_ylabel('Value')
-                        self.ax.grid(True)
-                        plt.setp(self.ax.get_xticklabels(), rotation=45)
-                        
-                        # Use tight layout to prevent label cutoff
-                        self.fig.tight_layout()
-                        
-                        # Update canvas
-                        self.canvas.draw()
-                
-                # Schedule next update
+        if not self.canvas or not self.ax:
+            self.after(UPDATE_INTERVAL * 2, self._update_trends)
+            return
+            
+        try:
+            selected_tag = self.tag_var.get()
+            if not selected_tag:
                 self.after(UPDATE_INTERVAL * 2, self._update_trends)
-            except Exception as e:
-                self.logger.error(f"Error updating trends: {e}")
+                return
+                
+            # Get data from the queue safely
+            with self.logger.data_lock:
+                if self.logger.data_queue.empty():
+                    self.after(UPDATE_INTERVAL * 2, self._update_trends)
+                    return
+                
+                # Convert queue to list for pandas
+                data_items = list(self.logger.data_queue.queue)
+            
+            if data_items:
+                # Clear previous plot
+                self.ax.clear()
+                
+                # Convert data to pandas for efficient processing
+                df = pd.DataFrame(data_items[-HISTORY_LIMIT:])
+                if 'timestamp' in df.columns and selected_tag in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    self.ax.plot(df['timestamp'], df[selected_tag])
+                    
+                    # Optimize plot appearance
+                    self.ax.set_xlabel('Time')
+                    self.ax.set_ylabel('Value')
+                    self.ax.grid(True)
+                    plt.setp(self.ax.get_xticklabels(), rotation=45)
+                    
+                    # Use tight layout to prevent label cutoff
+                    self.fig.tight_layout()
+                    
+                    # Update canvas
+                    self.canvas.draw()
+            
+        except Exception as e:
+            self.logger.error(f"Error updating trends: {e}")
+        finally:
+            # Schedule next update
+            self.after(UPDATE_INTERVAL * 2, self._update_trends)
 
     def create_monitor_tab(self):
         """Create monitor tab with optimized performance"""
@@ -789,6 +1148,9 @@ class PLCLoggerGUI(tk.Tk):
             self.logger.error(f"Error updating drive status: {e}")
             if self.drive_status:
                 self.drive_status.config(text="USB Error")
+        finally:
+            # Schedule next update
+            self.after(5000, self.update_drive_status)
 
     def create_notebook(self) -> None:
         """Create the notebook for tabs"""
@@ -874,8 +1236,22 @@ class PLCLoggerGUI(tk.Tk):
         scan_btn.grid(row=0, column=2, padx=5, pady=5)
         
         # Device list
-        self.device_list = tk.Listbox(device_frame, height=5)
+        self.device_list = tk.Listbox(device_frame, height=5, selectmode=tk.MULTIPLE)
         self.device_list.grid(row=1, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
+        
+        # Buttons frame for device actions
+        device_buttons_frame = ttk.Frame(device_frame)
+        device_buttons_frame.grid(row=2, column=0, columnspan=3, sticky='ew', padx=5, pady=5)
+        
+        # Add device button
+        add_device_btn = ttk.Button(device_buttons_frame, text="Add Selected Device",
+                                command=lambda: self.add_selected_device())
+        add_device_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Import tags button
+        import_tags_btn = ttk.Button(device_buttons_frame, text="Import Tags",
+                                 command=lambda: self.import_tags())
+        import_tags_btn.pack(side=tk.LEFT, padx=5)
         
         # Control buttons
         control_frame = ttk.Frame(frame)
@@ -890,9 +1266,22 @@ class PLCLoggerGUI(tk.Tk):
         self.stop_btn.pack(side=tk.LEFT, padx=5)
         self.stop_btn.state(['disabled'])
 
+    def validate_ip_range(self) -> bool:
+        """Validate IP range input"""
+        try:
+            ipaddress.ip_network(self.ip_range_entry.get(), strict=False)
+            return True
+        except ValueError as e:
+            messagebox.showerror("Invalid IP", f"Invalid IP range: {str(e)}")
+            return False
+
     def scan_devices(self) -> None:
         """Scan for PLC devices on the network"""
         try:
+            # Validate IP range first
+            if not self.validate_ip_range():
+                return
+                
             ip_range = self.ip_range_entry.get()
             self.logger.ip_range = ip_range
             self.update_status(f"Scanning {ip_range}...")
@@ -900,20 +1289,141 @@ class PLCLoggerGUI(tk.Tk):
             # Clear existing list
             self.device_list.delete(0, tk.END)
             
-            # Start scan
-            discovered = self.logger.scan_ip_range()
-            
-            # Update list
-            for ip in discovered:
-                device_info = self.logger.device_info.get(ip, {})
-                device_type = device_info.get('type', 'Unknown')
-                self.device_list.insert(tk.END, f"{ip} ({device_type})")
-            
-            self.update_status(f"Found {len(discovered)} devices")
+            # Start scan in a separate thread to prevent UI freezing
+            threading.Thread(target=self._scan_thread, args=(ip_range,), daemon=True).start()
             
         except Exception as e:
             self.logger.error(f"Error scanning devices: {e}")
             messagebox.showerror("Error", f"Failed to scan devices: {str(e)}")
+
+    def _scan_thread(self, ip_range: str) -> None:
+        """Thread function for IP scanning"""
+        try:
+            # Start scan
+            discovered = self.logger.scan_ip_range()
+            
+            # Update list in the main thread
+            self.after(0, lambda: self._update_device_list(discovered))
+            
+        except Exception as e:
+            self.logger.error(f"Error in scan thread: {e}")
+            self.after(0, lambda: self.update_status(f"Scan error: {str(e)}"))
+
+    def _update_device_list(self, discovered: List[str]) -> None:
+        """Update device list with discovered devices"""
+        # Clear existing list (just to be safe)
+        self.device_list.delete(0, tk.END)
+        
+        # Add each discovered device
+        for ip in discovered:
+            device_info = self.logger.device_info.get(ip, {})
+            device_type = device_info.get('type', 'Unknown')
+            self.device_list.insert(tk.END, f"{ip} ({device_type})")
+        
+        self.update_status(f"Found {len(discovered)} devices")
+
+    def add_selected_device(self):
+        """Add the selected device from the list to the monitored devices"""
+        try:
+            selected_indices = self.device_list.curselection()
+            if not selected_indices:
+                messagebox.showinfo("Selection", "Please select a device first")
+                return
+                
+            for idx in selected_indices:
+                item = self.device_list.get(idx)
+                # Extract IP address from the list item (format: "IP (Type)")
+                ip = item.split(" ")[0]
+                
+                if ip not in self.logger.ip_addresses:
+                    self.logger.ip_addresses.append(ip)
+                    
+                    # Initialize tags for this IP if not already present
+                    if ip not in self.logger.tags_to_log:
+                        self.logger.tags_to_log[ip] = []
+                        
+            self.update_status(f"Added {len(selected_indices)} device(s)")
+            
+        except Exception as e:
+            self.logger.error(f"Error adding device: {e}")
+            messagebox.showerror("Error", f"Failed to add device: {str(e)}")
+
+    def import_tags(self):
+        """Import tags from a file"""
+        try:
+            # Get the selected device first
+            selected_indices = self.device_list.curselection()
+            if not selected_indices:
+                messagebox.showinfo("Selection", "Please select a device first")
+                return
+                
+            # Use the first selected device
+            idx = selected_indices[0]
+            device_item = self.device_list.get(idx)
+            ip = device_item.split(" ")[0]
+            
+            # Show file dialog
+            filename = filedialog.askopenfilename(
+                title="Select Tags File",
+                filetypes=(
+                    ("CSV files", "*.csv"),
+                    ("Text files", "*.txt"),
+                    ("XML files", "*.xml"),
+                    ("All files", "*.*")
+                )
+            )
+            
+            if not filename:
+                return  # User cancelled
+                
+            # Update status
+            self.update_status(f"Importing tags from {filename}...")
+            
+            # Import tags in a background thread
+            threading.Thread(
+                target=self._import_tags_thread,
+                args=(filename, ip),
+                daemon=True
+            ).start()
+            
+        except Exception as e:
+            self.logger.error(f"Error starting tag import: {e}")
+            messagebox.showerror("Error", f"Failed to import tags: {str(e)}")
+            
+    def _import_tags_thread(self, filename: str, ip: str):
+        """Thread function for tag import"""
+        try:
+            # Import tags
+            imported_tags = self.logger.import_tags_from_file(filename, ip)
+            
+            # Update UI in main thread
+            self.after(0, lambda: self._update_after_import(ip, imported_tags))
+            
+        except Exception as e:
+            self.logger.error(f"Error in import thread: {e}")
+            self.after(0, lambda: self.update_status(f"Import error: {str(e)}"))
+            
+    def _update_after_import(self, ip: str, imported_tags: List[str]):
+        """Update UI after tag import"""
+        if imported_tags:
+            # Show success message
+            messagebox.showinfo(
+                "Import Successful",
+                f"Successfully imported {len(imported_tags)} tags for device {ip}"
+            )
+            
+            # Update tag combo for trends
+            self.update_tag_combo()
+            
+            # Update status
+            self.update_status(f"Imported {len(imported_tags)} tags")
+        else:
+            messagebox.showwarning(
+                "Import Issue",
+                "No tags were imported. Check the file format and logs for details."
+            )
+            
+            self.update_status("Import failed - no tags found")
 
     def start_logging(self) -> None:
         """Start the logging process"""
@@ -951,27 +1461,8 @@ class PLCLoggerGUI(tk.Tk):
 
     def update_monitor_data(self, data_point: Dict[str, Any]) -> None:
         """Update the monitor display with new data"""
-        try:
-            if not self.monitor_tree:
-                return
-                
-            # Clear existing items
-            for item in self.monitor_tree.get_children():
-                self.monitor_tree.delete(item)
-            
-            # Add new data
-            timestamp = data_point.get('timestamp', '')
-            for key, value in data_point.items():
-                if key != 'timestamp':
-                    ip, tag = key.split('_', 1)
-                    status = "OK" if value is not None else "Error"
-                    self.monitor_tree.insert('', 'end', values=(f"{ip}_{tag}", value, timestamp, status))
-            
-            # Update tag combo for trends
-            self.update_tag_combo()
-            
-        except Exception as e:
-            self.logger.error(f"Error updating monitor: {e}")
+        # This is handled by the _update_monitor method now
+        pass
 
     def update_tag_combo(self) -> None:
         """Update the tag combo box with available tags"""
@@ -990,6 +1481,20 @@ class PLCLoggerGUI(tk.Tk):
                 
         except Exception as e:
             self.logger.error(f"Error updating tag combo: {e}")
+            
+    def _on_closing(self):
+        """Handle application closing event"""
+        try:
+            if self.logger.running:
+                if messagebox.askyesno("Quit", "Logging is active. Stop logging and quit?"):
+                    self.logger.stop_logging()
+                    self.quit()
+                # If user selects "No", do nothing and return
+            else:
+                self.quit()
+        except Exception as e:
+            self.logger.error(f"Error during shutdown: {e}")
+            self.quit()
 
 def main():
     """Main entry point"""
@@ -1001,4 +1506,4 @@ def main():
         sys.exit(1)
 
 if __name__ == "__main__":
-    main() 
+    main()
