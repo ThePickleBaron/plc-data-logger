@@ -2,6 +2,7 @@
 """
 PLC Data Logger - Main Application
 A Python application for logging data from PLC devices.
+Optimized for Jetson Nano with display.
 """
 
 import os
@@ -19,11 +20,19 @@ import csv
 from typing import Dict, Any, List, Optional
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import matplotlib
+# Use Agg backend for better performance on Jetson Nano
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import pandas as pd
 from pylogix import PLC
 import psutil
+
+# Configure for Jetson Nano performance
+HISTORY_LIMIT = 500  # Reduced from 1000 for better memory usage
+UPDATE_INTERVAL = 1000  # GUI update interval in milliseconds
+BATCH_SIZE = 10  # Number of tags to read in a single batch
 
 # Configure logging
 def setup_logging() -> logging.Logger:
@@ -529,41 +538,30 @@ class PLCDataLogger:
         self.running = False
 
 class PLCLoggerGUI(tk.Tk):
-    """GUI class for the PLC Data Logger application"""
-    
     def __init__(self):
-        """Initialize the GUI"""
+        """Initialize the GUI with Jetson Nano optimizations"""
         super().__init__()
+        
+        # Set GUI parameters for Jetson display
         self.title("PLC Data Logger")
-        self.geometry("800x600")
+        self.geometry("800x480")  # Common Jetson display resolution
+        
+        # Enable hardware acceleration if available
+        try:
+            self.attributes('-hardware', True)
+        except:
+            pass
+            
+        # Reduce flickering
+        self.update_idletasks()
         
         # Initialize the data logger
         self.logger = PLCDataLogger()
         
-        # Initialize GUI variables
-        self.monitor_tree: Optional[ttk.Treeview] = None
-        self.tag_combo: Optional[ttk.Combobox] = None
-        self.tag_var: Optional[tk.StringVar] = None
-        self.range_var: Optional[tk.StringVar] = None
-        self.fig: Optional[plt.Figure] = None
-        self.ax: Optional[plt.Axes] = None
-        self.canvas: Optional[FigureCanvasTkAgg] = None
-        self.sample_var: Optional[tk.StringVar] = None
-        self.file_var: Optional[tk.StringVar] = None
-        self.retention_var: Optional[tk.StringVar] = None
-        self.auto_export_var: Optional[tk.BooleanVar] = None
-        self.device_var: Optional[tk.StringVar] = None
-        self.device_combo: Optional[ttk.Combobox] = None
-        self.tag_list: Optional[tk.Listbox] = None
-        self.selected_tags_list: Optional[tk.Listbox] = None
-        self.start_btn: Optional[ttk.Button] = None
-        self.stop_btn: Optional[ttk.Button] = None
-        self.status_label: Optional[ttk.Label] = None
-        self.drive_status: Optional[ttk.Label] = None
-        self.ip_range_entry: Optional[ttk.Entry] = None
-        self.device_list: Optional[tk.Listbox] = None
+        # Initialize GUI variables with proper typing
+        self._init_gui_variables()
         
-        # Create GUI elements
+        # Create GUI elements with optimized update intervals
         self.create_notebook()
         self.create_monitor_tab()
         self.create_trends_tab()
@@ -574,22 +572,134 @@ class PLCLoggerGUI(tk.Tk):
         
         # Update USB drive status
         self.update_drive_status()
-    
-    def create_notebook(self) -> None:
-        """Create the notebook for tabs"""
-        self.notebook = ttk.Notebook(self)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
         
-        # Create tab frames
-        self.monitor_tab = ttk.Frame(self.notebook)
-        self.trends_tab = ttk.Frame(self.notebook)
-        self.settings_tab = ttk.Frame(self.notebook)
+        # Configure update intervals
+        self._configure_update_intervals()
+
+    def _init_gui_variables(self):
+        """Initialize GUI variables with proper typing"""
+        self.monitor_tree: Optional[ttk.Treeview] = None
+        self.tag_combo: Optional[ttk.Combobox] = None
+        self.tag_var: tk.StringVar = tk.StringVar()
+        self.range_var: tk.StringVar = tk.StringVar()
+        self.fig: Optional[plt.Figure] = None
+        self.ax: Optional[plt.Axes] = None
+        self.canvas: Optional[FigureCanvasTkAgg] = None
+        self.sample_var: tk.StringVar = tk.StringVar(value="60")
+        self.file_var: tk.StringVar = tk.StringVar(value="3600")
+        self.retention_var: tk.StringVar = tk.StringVar(value="30")
+        self.auto_export_var: tk.BooleanVar = tk.BooleanVar(value=False)
+        self.device_var: tk.StringVar = tk.StringVar()
+        self.device_combo: Optional[ttk.Combobox] = None
+        self.tag_list: Optional[tk.Listbox] = None
+        self.selected_tags_list: Optional[tk.Listbox] = None
+        self.start_btn: Optional[ttk.Button] = None
+        self.stop_btn: Optional[ttk.Button] = None
+        self.status_label: Optional[ttk.Label] = None
+        self.drive_status: Optional[ttk.Label] = None
+        self.ip_range_entry: Optional[ttk.Entry] = None
+        self.device_list: Optional[tk.Listbox] = None
+
+    def _configure_update_intervals(self):
+        """Configure optimized update intervals for Jetson Nano"""
+        # Update monitor less frequently
+        self.after(UPDATE_INTERVAL, self._update_monitor)
         
-        # Add tabs to notebook
-        self.notebook.add(self.monitor_tab, text="Monitor")
-        self.notebook.add(self.trends_tab, text="Trends")
-        self.notebook.add(self.settings_tab, text="Settings")
-    
+        # Update drive status less frequently
+        self.after(5000, self._update_drive_status)
+        
+        # Update trends graph less frequently
+        self.after(UPDATE_INTERVAL * 2, self._update_trends)
+
+    def _update_monitor(self):
+        """Update monitor with optimized performance"""
+        if self.monitor_tree and hasattr(self.logger, 'data_history') and self.logger.data_history:
+            try:
+                # Only update changed values
+                current_data = self.logger.data_history[-1]
+                for item in self.monitor_tree.get_children():
+                    tag_name = self.monitor_tree.item(item)['values'][0]
+                    if tag_name in current_data:
+                        new_value = current_data[tag_name]
+                        if str(new_value) != str(self.monitor_tree.item(item)['values'][1]):
+                            self.monitor_tree.item(item, values=(tag_name, new_value, 
+                                                               current_data.get('timestamp', ''), 
+                                                               'OK' if new_value is not None else 'Error'))
+                
+                # Schedule next update
+                self.after(UPDATE_INTERVAL, self._update_monitor)
+            except Exception as e:
+                self.logger.error(f"Error updating monitor: {e}")
+
+    def _update_trends(self):
+        """Update trends with optimized performance"""
+        if self.canvas and self.ax:
+            try:
+                selected_tag = self.tag_var.get()
+                if selected_tag and self.logger.data_history:
+                    # Clear previous plot
+                    self.ax.clear()
+                    
+                    # Convert data to pandas for efficient processing
+                    df = pd.DataFrame(self.logger.data_history[-HISTORY_LIMIT:])
+                    if 'timestamp' in df.columns and selected_tag in df.columns:
+                        df['timestamp'] = pd.to_datetime(df['timestamp'])
+                        self.ax.plot(df['timestamp'], df[selected_tag])
+                        
+                        # Optimize plot appearance
+                        self.ax.set_xlabel('Time')
+                        self.ax.set_ylabel('Value')
+                        self.ax.grid(True)
+                        plt.setp(self.ax.get_xticklabels(), rotation=45)
+                        
+                        # Use tight layout to prevent label cutoff
+                        self.fig.tight_layout()
+                        
+                        # Update canvas
+                        self.canvas.draw()
+                
+                # Schedule next update
+                self.after(UPDATE_INTERVAL * 2, self._update_trends)
+            except Exception as e:
+                self.logger.error(f"Error updating trends: {e}")
+
+    def create_monitor_tab(self):
+        """Create monitor tab with optimized performance"""
+        if not hasattr(self, 'monitor_tab'):
+            return
+            
+        # Create frame with proper weights
+        frame = ttk.Frame(self.monitor_tab)
+        frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Configure grid weights for better resizing
+        frame.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(1, weight=1)
+        
+        # Create treeview with scrollbar
+        self.monitor_tree = ttk.Treeview(frame, columns=('Tag', 'Value', 'Timestamp', 'Status'),
+                                       show='headings')
+        
+        # Configure columns for optimal display
+        self.monitor_tree.heading('Tag', text='Tag')
+        self.monitor_tree.heading('Value', text='Value')
+        self.monitor_tree.heading('Timestamp', text='Timestamp')
+        self.monitor_tree.heading('Status', text='Status')
+        
+        # Set column widths based on content
+        self.monitor_tree.column('Tag', width=200)
+        self.monitor_tree.column('Value', width=100)
+        self.monitor_tree.column('Timestamp', width=150)
+        self.monitor_tree.column('Status', width=80)
+        
+        # Add scrollbar
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.monitor_tree.yview)
+        self.monitor_tree.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack with proper fill and expand
+        self.monitor_tree.grid(row=1, column=0, sticky='nsew')
+        scrollbar.grid(row=1, column=1, sticky='ns')
+
     def create_status_bar(self) -> None:
         """Create the status bar at the bottom of the window"""
         status_frame = ttk.Frame(self)
@@ -600,52 +710,6 @@ class PLCLoggerGUI(tk.Tk):
         
         self.drive_status = ttk.Label(status_frame, text="No USB Drive")
         self.drive_status.pack(side=tk.RIGHT)
-    
-    def update_monitor_data(self, data_point: Dict[str, Any]) -> None:
-        """Update the monitor display with new data
-        
-        Args:
-            data_point (Dict[str, Any]): New data point to display
-        """
-        try:
-            if not self.monitor_tree:
-                return
-                
-            # Clear existing items
-            for item in self.monitor_tree.get_children():
-                self.monitor_tree.delete(item)
-            
-            # Add new data
-            timestamp = data_point.get('timestamp', '')
-            for key, value in data_point.items():
-                if key != 'timestamp':
-                    ip, tag = key.split('_', 1)
-                    status = "OK" if value is not None else "Error"
-                    self.monitor_tree.insert('', 'end', values=(f"{ip}_{tag}", value, timestamp, status))
-            
-            # Update tag combo for trends
-            self.update_tag_combo()
-            
-        except Exception as e:
-            self.logger.error(f"Error updating monitor: {e}")
-    
-    def update_tag_combo(self) -> None:
-        """Update the tag combo box with available tags"""
-        try:
-            if not self.tag_combo:
-                return
-                
-            tags = set()
-            for ip, tag_list in self.logger.tags_to_log.items():
-                for tag in tag_list:
-                    tags.add(f"{ip}_{tag}")
-            
-            self.tag_combo['values'] = sorted(list(tags))
-            if tags and not self.tag_var.get():
-                self.tag_combo.set(next(iter(tags)))
-                
-        except Exception as e:
-            self.logger.error(f"Error updating tag combo: {e}")
     
     def update_status(self, message: str) -> None:
         """Update the status bar message

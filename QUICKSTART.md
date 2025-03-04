@@ -29,6 +29,129 @@ This guide will help you get started with the PLC Data Logger application quickl
    ./plc_logger_launcher.sh
    ```
 
+## Jetson Nano Setup
+
+### Prerequisites
+1. Jetson Nano with display
+2. Python 3.6 or later
+3. Git installed
+4. Network connection to PLCs
+
+### Installation Steps for Jetson Nano
+
+1. Update system packages:
+```bash
+sudo apt-get update
+sudo apt-get upgrade
+```
+
+2. Install required system dependencies:
+```bash
+sudo apt-get install -y python3-pip python3-venv python3-tk
+sudo apt-get install -y libhdf5-serial-dev hdf5-tools libhdf5-dev
+sudo apt-get install -y libatlas-base-dev gfortran
+```
+
+3. Create and activate a Python virtual environment:
+```bash
+python3 -m venv ~/plc_env
+source ~/plc_env/bin/activate
+```
+
+4. Clone the repository:
+```bash
+cd ~
+git clone https://github.com/ThePickleBaron/plc-data-logger.git
+cd plc-data-logger
+```
+
+5. Install Python dependencies:
+```bash
+pip3 install --upgrade pip
+pip3 install -r requirements.txt
+```
+
+6. Set up execution permissions:
+```bash
+chmod +x setup.sh
+chmod +x plc_logger_launcher.sh
+chmod +x create_offline_package.sh
+```
+
+7. Run the setup script:
+```bash
+./setup.sh
+```
+
+8. Launch the application:
+```bash
+./plc_logger_launcher.sh
+```
+
+### Performance Tips for Jetson Nano
+
+1. Monitor CPU temperature:
+```bash
+tegrastats
+```
+
+2. If needed, enable fan control:
+```bash
+sudo jetson_clocks
+```
+
+3. For better GUI performance:
+- Keep the number of monitored tags under 50
+- Use the default update interval (1 second)
+- Close other graphical applications when running the logger
+
+### Troubleshooting
+
+1. If you see "Display not found" error:
+```bash
+export DISPLAY=:0
+```
+
+2. If matplotlib shows backend errors:
+```bash
+sudo apt-get install python3-matplotlib
+```
+
+3. If tkinter is not found:
+```bash
+sudo apt-get install python3-tk
+```
+
+4. If USB drives are not detected:
+- Ensure the drive is formatted as ext4 or FAT32
+- Check mount permissions:
+```bash
+sudo chmod 777 /media/nvidia
+```
+
+### Additional Configuration
+
+1. Auto-start on boot:
+```bash
+mkdir -p ~/.config/autostart
+cat << EOF > ~/.config/autostart/plc_logger.desktop
+[Desktop Entry]
+Type=Application
+Name=PLC Logger
+Exec=/home/nvidia/plc-data-logger/plc_logger_launcher.sh
+EOF
+```
+
+2. Monitor system resources:
+```bash
+htop
+```
+
+3. Check logs:
+```bash
+tail -f ~/plc-data-logger/logs/plc_logger_*.log
+```
+
 ## Basic Usage
 
 ### 1. Adding Devices
