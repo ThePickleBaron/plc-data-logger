@@ -625,7 +625,7 @@ class PLCLoggerGUI(tk.Tk):
         self.after(UPDATE_INTERVAL, self._update_monitor)
         
         # Update drive status less frequently
-        self.after(5000, self._update_drive_status)
+        self.after(5000, self.update_drive_status)
         
         # Update trends graph less frequently
         self.after(UPDATE_INTERVAL * 2, self._update_trends)
