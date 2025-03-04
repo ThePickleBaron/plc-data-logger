@@ -158,31 +158,7 @@ The application monitors:
 - **Buffered Writing**: Collects data and writes to disk in batches
 - **Thread Management**: Uses background threads for I/O operations
 
-## Troubleshooting
 
-1. **Connection Issues**
-   - Check network connectivity
-   - Verify PLC IP addresses
-   - Check firewall settings
-   - Review connection logs with increased verbosity
-
-2. **Data Collection Problems**
-   - Verify tag names
-   - Check sampling interval
-   - Review error logs
-   - Check disk space
-
-3. **GUI Issues**
-   - Restart application
-   - Check system resources
-   - Verify Python installation
-   - Review application logs
-
-4. **File I/O Issues**
-   - Check disk space
-   - Verify permissions on log directories
-   - Check USB drive connections
-   - Review file operation logs
 
 ## Contributing
 
@@ -199,14 +175,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Support
 
 For support, please:
-1. Check the documentation
-2. Review existing issues
-3. Create a new issue if needed
-4. Contact the maintainers
+Figure it out or branch and hit me up.
+ThePickleBaron 
 
-## Acknowledgments
-
-- ThePickleBaron for the original concept and emergency deployment
-- Built with Python and Tkinter
-- Uses Matplotlib for visualization
-- Inspired by industrial automation needs
