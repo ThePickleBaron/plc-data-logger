@@ -155,7 +155,7 @@ class PLCDataLogger:
         self.save_interval = save_interval
         self.retention_days = 30  # Default retention period
         self.ip_addresses: List[str] = []
-        self.ip_range = "10.13.50.0/24"  # Default subnet
+        self.ip_range = "192.168.0.101/24"  # Default subnet
         self.tags_to_log: Dict[str, List[str]] = {}  # Dict of {ip: [tags]}
         self.detected_tags: Dict[str, List[str]] = {}  # Dict of {ip: [tags]}
         self.device_info: Dict[str, Dict[str, str]] = {}  # Dict of {ip: {type, description}}
@@ -1227,7 +1227,7 @@ class PLCLoggerGUI(tk.Tk):
         # IP range entry
         ttk.Label(device_frame, text="IP Range:").grid(row=0, column=0, padx=5, pady=5)
         self.ip_range_entry = ttk.Entry(device_frame)
-        self.ip_range_entry.insert(0, "10.13.50.0/24")
+        self.ip_range_entry.insert(0, "192.168.0.101/24")
         self.ip_range_entry.grid(row=0, column=1, padx=5, pady=5)
         
         # Scan button
