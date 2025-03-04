@@ -27,7 +27,6 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 import pandas as pd
 from pylogix import PLC
-import psutil
 
 # Configure for Jetson Nano performance
 HISTORY_LIMIT = 500  # Reduced from 1000 for better memory usage
@@ -394,16 +393,15 @@ class PLCDataLogger:
                 self.data_file.close()
 
     def discover_usb_drives(self) -> List[str]:
-        """Discover mounted USB drives
+        """Discover mounted USB drives with fallback methods
         
         Returns:
             List[str]: List of mount points for USB drives
         """
+        usb_drives = []
         try:
-            usb_drives = []
-            
-            # On Linux, check /proc/mounts for USB devices
             if sys.platform.startswith('linux'):
+                # Try reading from /proc/mounts first
                 if os.path.exists('/proc/mounts'):
                     with open('/proc/mounts', 'r') as f:
                         for line in f:
@@ -414,22 +412,31 @@ class PLCDataLogger:
                                     if os.path.exists(mount_point) and os.access(mount_point, os.W_OK):
                                         usb_drives.append(mount_point)
             
-            # Fallback method using psutil
-            partitions = psutil.disk_partitions()
-            for p in partitions:
-                # Skip the root filesystem and non-removable drives
-                if p.mountpoint == '/' or p.device == '':
-                    continue
-                
-                if 'removable' in p.opts or any(x in p.mountpoint for x in ['/media/', '/mnt/']):
-                    if os.path.exists(p.mountpoint) and os.access(p.mountpoint, os.W_OK):
-                        usb_drives.append(p.mountpoint)
-            
-            return usb_drives
-            
+                # Fallback to checking common USB mount points
+                if not usb_drives:
+                    common_paths = ['/media', '/mnt']
+                    for base_path in common_paths:
+                        if os.path.exists(base_path):
+                            for item in os.listdir(base_path):
+                                full_path = os.path.join(base_path, item)
+                                if os.path.ismount(full_path) and os.access(full_path, os.W_OK):
+                                    usb_drives.append(full_path)
+                                
+            elif sys.platform.startswith('win'):
+                # Use Windows API to detect removable drives
+                import ctypes
+                drives = []
+                bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+                for letter in range(65, 91):  # A-Z
+                    if bitmask & (1 << (letter - 65)):
+                        drive = chr(letter) + ":\\"
+                        if ctypes.windll.kernel32.GetDriveTypeW(drive) == 2:  # DRIVE_REMOVABLE
+                            if os.path.exists(drive) and os.access(drive, os.W_OK):
+                                usb_drives.append(drive)
         except Exception as e:
             self.logger.error(f"Error discovering USB drives: {e}")
-            return []
+        
+        return usb_drives
 
     def scan_ip_range(self) -> List[str]:
         """Scan a range of IP addresses for Allen-Bradley PLCs
@@ -542,21 +549,18 @@ class PLCLoggerGUI(tk.Tk):
         """Initialize the GUI with Jetson Nano optimizations"""
         super().__init__()
         
+        # Initialize logger first
+        self.logger = PLCDataLogger()
+        
         # Set GUI parameters for Jetson display
         self.title("PLC Data Logger")
         self.geometry("800x480")  # Common Jetson display resolution
         
-        # Enable hardware acceleration if available
-        try:
-            self.attributes('-hardware', True)
-        except:
-            pass
-            
-        # Reduce flickering
-        self.update_idletasks()
-        
-        # Initialize the data logger
-        self.logger = PLCDataLogger()
+        # Initialize notebook
+        self.notebook: Optional[ttk.Notebook] = None
+        self.monitor_tab: Optional[ttk.Frame] = None
+        self.trends_tab: Optional[ttk.Frame] = None
+        self.settings_tab: Optional[ttk.Frame] = None
         
         # Initialize GUI variables with proper typing
         self._init_gui_variables()
@@ -576,29 +580,44 @@ class PLCLoggerGUI(tk.Tk):
         # Configure update intervals
         self._configure_update_intervals()
 
-    def _init_gui_variables(self):
+    def _init_gui_variables(self) -> None:
         """Initialize GUI variables with proper typing"""
+        # Tree and list variables
         self.monitor_tree: Optional[ttk.Treeview] = None
+        self.device_list: Optional[tk.Listbox] = None
+        self.tag_list: Optional[tk.Listbox] = None
+        self.selected_tags_list: Optional[tk.Listbox] = None
+        
+        # Combo boxes
         self.tag_combo: Optional[ttk.Combobox] = None
+        self.device_combo: Optional[ttk.Combobox] = None
+        
+        # String variables
         self.tag_var: tk.StringVar = tk.StringVar()
         self.range_var: tk.StringVar = tk.StringVar()
-        self.fig: Optional[plt.Figure] = None
-        self.ax: Optional[plt.Axes] = None
-        self.canvas: Optional[FigureCanvasTkAgg] = None
         self.sample_var: tk.StringVar = tk.StringVar(value="60")
         self.file_var: tk.StringVar = tk.StringVar(value="3600")
         self.retention_var: tk.StringVar = tk.StringVar(value="30")
-        self.auto_export_var: tk.BooleanVar = tk.BooleanVar(value=False)
         self.device_var: tk.StringVar = tk.StringVar()
-        self.device_combo: Optional[ttk.Combobox] = None
-        self.tag_list: Optional[tk.Listbox] = None
-        self.selected_tags_list: Optional[tk.Listbox] = None
+        
+        # Boolean variables
+        self.auto_export_var: tk.BooleanVar = tk.BooleanVar(value=False)
+        
+        # Matplotlib variables
+        self.fig: Optional[plt.Figure] = None
+        self.ax: Optional[plt.Axes] = None
+        self.canvas: Optional[FigureCanvasTkAgg] = None
+        
+        # Entry fields
+        self.ip_range_entry: Optional[ttk.Entry] = None
+        
+        # Buttons
         self.start_btn: Optional[ttk.Button] = None
         self.stop_btn: Optional[ttk.Button] = None
+        
+        # Labels
         self.status_label: Optional[ttk.Label] = None
         self.drive_status: Optional[ttk.Label] = None
-        self.ip_range_entry: Optional[ttk.Entry] = None
-        self.device_list: Optional[tk.Listbox] = None
 
     def _configure_update_intervals(self):
         """Configure optimized update intervals for Jetson Nano"""
@@ -612,24 +631,47 @@ class PLCLoggerGUI(tk.Tk):
         self.after(UPDATE_INTERVAL * 2, self._update_trends)
 
     def _update_monitor(self):
-        """Update monitor with optimized performance"""
-        if self.monitor_tree and hasattr(self.logger, 'data_history') and self.logger.data_history:
-            try:
-                # Only update changed values
+        """Update monitor with optimized performance and error handling"""
+        if not self.monitor_tree or not hasattr(self.logger, 'data_history'):
+            return
+        
+        try:
+            if self.logger.data_history:
                 current_data = self.logger.data_history[-1]
+                existing_items = set()
+                
+                # Get existing items for comparison
                 for item in self.monitor_tree.get_children():
                     tag_name = self.monitor_tree.item(item)['values'][0]
+                    existing_items.add(tag_name)
                     if tag_name in current_data:
                         new_value = current_data[tag_name]
-                        if str(new_value) != str(self.monitor_tree.item(item)['values'][1]):
-                            self.monitor_tree.item(item, values=(tag_name, new_value, 
-                                                               current_data.get('timestamp', ''), 
-                                                               'OK' if new_value is not None else 'Error'))
+                        current_values = self.monitor_tree.item(item)['values']
+                        if str(new_value) != str(current_values[1]):
+                            self.monitor_tree.item(item, values=(
+                                tag_name,
+                                new_value,
+                                current_data.get('timestamp', ''),
+                                'OK' if new_value is not None else 'Error'
+                            ))
                 
-                # Schedule next update
+                # Add new items that don't exist
+                for tag_name, value in current_data.items():
+                    if tag_name != 'timestamp' and tag_name not in existing_items:
+                        self.monitor_tree.insert('', 'end', values=(
+                            tag_name,
+                            value,
+                            current_data.get('timestamp', ''),
+                            'OK' if value is not None else 'Error'
+                        ))
+        except Exception as e:
+            self.logger.error(f"Error updating monitor: {e}")
+        finally:
+            # Schedule next update with error handling
+            try:
                 self.after(UPDATE_INTERVAL, self._update_monitor)
             except Exception as e:
-                self.logger.error(f"Error updating monitor: {e}")
+                self.logger.error(f"Error scheduling monitor update: {e}")
 
     def _update_trends(self):
         """Update trends with optimized performance"""

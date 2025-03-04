@@ -1,6 +1,6 @@
 # PLC Data Logger
 
-A robust and efficient Python application for logging data from PLC devices with a modern GUI interface.
+A robust and efficient Python application for logging data from PLC devices with a modern GUI interface.  Built real quick with a little help from claude as an emergency data logging solution for a system commissioing...Should be fairly robust. Hope it helps. 
 
 ## Features
 
@@ -121,7 +121,7 @@ For support, please:
 
 ## Acknowledgments
 
-- Thanks to all contributors
+- ThePickleBaron hopes someone gets some relief from this. 
 - Built with Python and Tkinter
 - Uses Matplotlib for visualization
 - Inspired by industrial automation needs 
