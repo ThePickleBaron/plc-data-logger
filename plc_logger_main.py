@@ -737,6 +737,207 @@ class PLCLoggerGUI(tk.Tk):
             if self.drive_status:
                 self.drive_status.config(text="USB Error")
 
+    def create_notebook(self) -> None:
+        """Create the notebook for tabs"""
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Create tab frames
+        self.monitor_tab = ttk.Frame(self.notebook)
+        self.trends_tab = ttk.Frame(self.notebook)
+        self.settings_tab = ttk.Frame(self.notebook)
+        
+        # Add tabs to notebook
+        self.notebook.add(self.monitor_tab, text="Monitor")
+        self.notebook.add(self.trends_tab, text="Trends")
+        self.notebook.add(self.settings_tab, text="Settings")
+
+    def create_trends_tab(self) -> None:
+        """Create trends tab with graph and controls"""
+        # Create main frame
+        frame = ttk.Frame(self.trends_tab)
+        frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Create controls frame
+        controls_frame = ttk.Frame(frame)
+        controls_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Tag selection
+        ttk.Label(controls_frame, text="Tag:").pack(side=tk.LEFT, padx=5)
+        self.tag_combo = ttk.Combobox(controls_frame, textvariable=self.tag_var)
+        self.tag_combo.pack(side=tk.LEFT, padx=5)
+        
+        # Time range selection
+        ttk.Label(controls_frame, text="Range:").pack(side=tk.LEFT, padx=5)
+        range_combo = ttk.Combobox(controls_frame, textvariable=self.range_var,
+                                 values=["1 hour", "6 hours", "12 hours", "24 hours"])
+        range_combo.pack(side=tk.LEFT, padx=5)
+        range_combo.set("1 hour")
+        
+        # Create matplotlib figure
+        self.fig, self.ax = plt.subplots(figsize=(8, 4))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=frame)
+        self.canvas.draw()
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def create_settings_tab(self) -> None:
+        """Create settings tab with configuration options"""
+        # Create main frame
+        frame = ttk.Frame(self.settings_tab)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        # Sampling settings
+        sampling_frame = ttk.LabelFrame(frame, text="Sampling Settings")
+        sampling_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # Sample interval
+        ttk.Label(sampling_frame, text="Sample Interval (seconds):").grid(row=0, column=0, padx=5, pady=5)
+        sample_entry = ttk.Entry(sampling_frame, textvariable=self.sample_var)
+        sample_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        # File rotation interval
+        ttk.Label(sampling_frame, text="File Rotation (seconds):").grid(row=1, column=0, padx=5, pady=5)
+        file_entry = ttk.Entry(sampling_frame, textvariable=self.file_var)
+        file_entry.grid(row=1, column=1, padx=5, pady=5)
+        
+        # Data retention
+        ttk.Label(sampling_frame, text="Data Retention (days):").grid(row=2, column=0, padx=5, pady=5)
+        retention_entry = ttk.Entry(sampling_frame, textvariable=self.retention_var)
+        retention_entry.grid(row=2, column=1, padx=5, pady=5)
+        
+        # Device management
+        device_frame = ttk.LabelFrame(frame, text="Device Management")
+        device_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        # IP range entry
+        ttk.Label(device_frame, text="IP Range:").grid(row=0, column=0, padx=5, pady=5)
+        self.ip_range_entry = ttk.Entry(device_frame)
+        self.ip_range_entry.insert(0, "10.13.50.0/24")
+        self.ip_range_entry.grid(row=0, column=1, padx=5, pady=5)
+        
+        # Scan button
+        scan_btn = ttk.Button(device_frame, text="Scan Devices",
+                            command=lambda: self.scan_devices())
+        scan_btn.grid(row=0, column=2, padx=5, pady=5)
+        
+        # Device list
+        self.device_list = tk.Listbox(device_frame, height=5)
+        self.device_list.grid(row=1, column=0, columnspan=3, sticky='nsew', padx=5, pady=5)
+        
+        # Control buttons
+        control_frame = ttk.Frame(frame)
+        control_frame.pack(fill=tk.X, padx=5, pady=10)
+        
+        self.start_btn = ttk.Button(control_frame, text="Start Logging",
+                                  command=lambda: self.start_logging())
+        self.start_btn.pack(side=tk.LEFT, padx=5)
+        
+        self.stop_btn = ttk.Button(control_frame, text="Stop Logging",
+                                 command=lambda: self.stop_logging())
+        self.stop_btn.pack(side=tk.LEFT, padx=5)
+        self.stop_btn.state(['disabled'])
+
+    def scan_devices(self) -> None:
+        """Scan for PLC devices on the network"""
+        try:
+            ip_range = self.ip_range_entry.get()
+            self.logger.ip_range = ip_range
+            self.update_status(f"Scanning {ip_range}...")
+            
+            # Clear existing list
+            self.device_list.delete(0, tk.END)
+            
+            # Start scan
+            discovered = self.logger.scan_ip_range()
+            
+            # Update list
+            for ip in discovered:
+                device_info = self.logger.device_info.get(ip, {})
+                device_type = device_info.get('type', 'Unknown')
+                self.device_list.insert(tk.END, f"{ip} ({device_type})")
+            
+            self.update_status(f"Found {len(discovered)} devices")
+            
+        except Exception as e:
+            self.logger.error(f"Error scanning devices: {e}")
+            messagebox.showerror("Error", f"Failed to scan devices: {str(e)}")
+
+    def start_logging(self) -> None:
+        """Start the logging process"""
+        try:
+            # Update intervals
+            self.logger.sample_interval = int(self.sample_var.get())
+            self.logger.save_interval = int(self.file_var.get())
+            self.logger.retention_days = int(self.retention_var.get())
+            
+            # Start logging
+            self.logger.start_logging(update_callback=self.update_monitor_data)
+            
+            # Update UI
+            self.start_btn.state(['disabled'])
+            self.stop_btn.state(['!disabled'])
+            self.update_status("Logging started")
+            
+        except Exception as e:
+            self.logger.error(f"Error starting logging: {e}")
+            messagebox.showerror("Error", f"Failed to start logging: {str(e)}")
+
+    def stop_logging(self) -> None:
+        """Stop the logging process"""
+        try:
+            self.logger.stop_logging()
+            
+            # Update UI
+            self.stop_btn.state(['disabled'])
+            self.start_btn.state(['!disabled'])
+            self.update_status("Logging stopped")
+            
+        except Exception as e:
+            self.logger.error(f"Error stopping logging: {e}")
+            messagebox.showerror("Error", f"Failed to stop logging: {str(e)}")
+
+    def update_monitor_data(self, data_point: Dict[str, Any]) -> None:
+        """Update the monitor display with new data"""
+        try:
+            if not self.monitor_tree:
+                return
+                
+            # Clear existing items
+            for item in self.monitor_tree.get_children():
+                self.monitor_tree.delete(item)
+            
+            # Add new data
+            timestamp = data_point.get('timestamp', '')
+            for key, value in data_point.items():
+                if key != 'timestamp':
+                    ip, tag = key.split('_', 1)
+                    status = "OK" if value is not None else "Error"
+                    self.monitor_tree.insert('', 'end', values=(f"{ip}_{tag}", value, timestamp, status))
+            
+            # Update tag combo for trends
+            self.update_tag_combo()
+            
+        except Exception as e:
+            self.logger.error(f"Error updating monitor: {e}")
+
+    def update_tag_combo(self) -> None:
+        """Update the tag combo box with available tags"""
+        try:
+            if not self.tag_combo:
+                return
+                
+            tags = set()
+            for ip, tag_list in self.logger.tags_to_log.items():
+                for tag in tag_list:
+                    tags.add(f"{ip}_{tag}")
+            
+            self.tag_combo['values'] = sorted(list(tags))
+            if tags and not self.tag_var.get():
+                self.tag_combo.set(next(iter(tags)))
+                
+        except Exception as e:
+            self.logger.error(f"Error updating tag combo: {e}")
+
 def main():
     """Main entry point"""
     try:
