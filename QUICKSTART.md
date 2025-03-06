@@ -12,7 +12,7 @@ This guide will help you get started with the PLC Data Logger application quickl
 
 1. **Clone the Repository**
    ```bash
-   git clone https://github.com/yourusername/plc_data_logger.git
+   git clone https://github.com/ThePickleBaron/plc-data-logger.git
    cd plc_data_logger
    ```
 
